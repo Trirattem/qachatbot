@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Environment & secrets
+.env
+credentials/
+
+# Generated output
+screenshots/
+logs/
+reports/
+
+# OS
+.DS_Store
+Thumbs.db
