@@ -1,0 +1,33 @@
+{
+  "name": "chatbot-qa-automation",
+  "version": "2.0.0",
+  "description": "Automated chatbot testing system using Playwright and Google Docs — Two-Phase Mode",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "test": "node src/index.js",
+    "test:dry": "node src/index.js --dry-run",
+    "test:resume": "node src/index.js --resume",
+    "test:reset": "node src/index.js --reset",
+    "test:browser-only": "node src/index.js --browser-only --resume",
+    "test:docs-only": "node src/index.js --docs-only",
+    "test:docs-only:dry": "node src/index.js --docs-only --dry-run",
+    "migrate": "node migrate_checkpoint.js",
+    "install:browsers": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.44.0",
+    "googleapis": "^140.0.0",
+    "dotenv": "^16.4.5",
+    "chalk": "^5.3.0",
+    "winston": "^3.13.0",
+    "string-similarity": "^4.0.4",
+    "date-fns": "^3.6.0",
+    "p-limit": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "QA Automation Team",
+  "license": "MIT"
+}
