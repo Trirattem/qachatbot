@@ -1,7 +1,7 @@
 {
   "name": "chatbot-qa-automation",
-  "version": "2.0.0",
-  "description": "Automated chatbot testing system using Playwright and Google Docs — Two-Phase Mode",
+  "version": "3.0.0",
+  "description": "Automated chatbot testing system using Playwright and Google Docs/Sheets — Two-Phase Mode",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
@@ -10,8 +10,17 @@
     "test:resume": "node src/index.js --resume",
     "test:reset": "node src/index.js --reset",
     "test:browser-only": "node src/index.js --browser-only --resume",
+
     "test:docs-only": "node src/index.js --docs-only",
     "test:docs-only:dry": "node src/index.js --docs-only --dry-run",
+
+    "test:sheets": "node src/index.js --use-sheets",
+    "test:sheets:dry": "node src/index.js --use-sheets --dry-run",
+    "test:sheets:resume": "node src/index.js --use-sheets --resume",
+    "test:sheets:reset": "node src/index.js --use-sheets --reset",
+    "test:sheets-only": "node src/index.js --sheets-only",
+    "test:sheets-only:dry": "node src/index.js --sheets-only --dry-run",
+
     "migrate": "node migrate_checkpoint.js",
     "install:browsers": "npx playwright install chromium"
   },

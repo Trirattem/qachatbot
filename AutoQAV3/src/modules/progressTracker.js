@@ -1,31 +1,8 @@
 /**
- * src/modules/progressTracker.js  (v2 — two-phase)
+ * src/modules/progressTracker.js  (v3 — sheets + docs)
  * ─────────────────────────────────────────────────────────────
- * เก็บผล browser phase ทั้งหมดไว้ใน JSON
- * เพิ่ม writtenToDocs flag เพื่อให้ Docs phase รู้ว่าอะไรยังไม่ได้ write
- *
- * Schema:
- * {
- *   "documentId": "...",
- *   "startedAt": "...",
- *   "updatedAt": "...",
- *   "lastCompletedTestId": "TRD_AI_007",
- *   "lastCompletedIndex": 6,
- *   "completed": {
- *     "TRD_AI_001": {
- *       "status": "PASS",
- *       "similarity": 0.374,
- *       "timestamp": "...",
- *       "screenshotPath": "...",
- *       "actual": "...",
- *       "reason": "...",
- *       "attempts": 2,
- *       "selectedAttempt": 2,
- *       "writtenToDocs": false    ← ใหม่
- *     },
- *     ...
- *   }
- * }
+ * รองรับทั้ง writtenToSheets และ writtenToDocs
+ * เพื่อ backward-compat กับ checkpoint เก่าที่ใช้ writtenToSheets
  */
 
 import fs from 'fs';
@@ -49,11 +26,31 @@ class ProgressTracker {
     if (fs.existsSync(this.filePath)) {
       try {
         this.data = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
-        const total     = Object.keys(this.data.completed).length;
-        const written   = Object.values(this.data.completed).filter(v => v.writtenToDocs).length;
-        const pending   = total - written;
+
+        // ── migrate: writtenToSheets → writtenToDocs ──────────
+        let migrated = 0;
+        for (const entry of Object.values(this.data.completed ?? {})) {
+          // ถ้ามี writtenToSheets แต่ยังไม่มี writtenToDocs → copy ค่ามา
+          if (typeof entry.writtenToSheets === 'boolean' && typeof entry.writtenToDocs !== 'boolean') {
+            entry.writtenToDocs = entry.writtenToSheets;
+            migrated++;
+          }
+          // ถ้าไม่มีทั้งคู่ → ตั้งเป็น false
+          if (typeof entry.writtenToDocs !== 'boolean') {
+            entry.writtenToDocs = false;
+            migrated++;
+          }
+        }
+        if (migrated > 0) {
+          logger.info(`🔄 Migrated ${migrated} checkpoint entries (writtenToSheets → writtenToDocs)`);
+          this._flush();
+        }
+
+        const total   = Object.keys(this.data.completed).length;
+        const written = Object.values(this.data.completed).filter(v => v.writtenToDocs).length;
+        const pending = total - written;
         logger.info(`📂 โหลด checkpoint: ${this.filePath}`);
-        logger.info(`   ทำไปแล้ว ${total} case  |  เขียน Docs แล้ว ${written}  |  pending ${pending}`);
+        logger.info(`   ทำไปแล้ว ${total} case  |  เขียนแล้ว ${written}  |  pending ${pending}`);
         logger.info(`   หยุดล่าสุดที่: ${this.data.lastCompletedTestId ?? '-'}`);
         return true;
       } catch (err) {
@@ -66,39 +63,51 @@ class ProgressTracker {
 
   _init() {
     this.data = {
-      documentId: this.documentId,
-      startedAt: dateFormat(new Date(), 'yyyy-MM-dd HH:mm:ss'),
-      updatedAt: null,
-      lastCompletedTestId: null,
-      lastCompletedIndex: -1,
-      completed: {},
+      documentId:           this.documentId,
+      spreadsheetId:        config.google.spreadsheetId || '',
+      startedAt:            dateFormat(new Date(), 'yyyy-MM-dd HH:mm:ss'),
+      updatedAt:            null,
+      lastCompletedTestId:  null,
+      lastCompletedIndex:   -1,
+      completed:            {},
     };
   }
 
   // บันทึกหลัง browser phase เสร็จแต่ละข้อ
   save(testId, index, result) {
-    this.data.updatedAt = dateFormat(new Date(), 'yyyy-MM-dd HH:mm:ss');
-    this.data.lastCompletedTestId = testId;
-    this.data.lastCompletedIndex  = index;
-    this.data.completed[testId]   = {
-      status:         result.status,
-      similarity:     result.similarity,
-      timestamp:      result.timestamp,
-      screenshotPath: result.screenshotPath ?? '',
-      actual:         result.actual ?? '',
-      reason:         result.reason ?? '',
-      attempts:       result.attempts ?? 1,
+    this.data.updatedAt            = dateFormat(new Date(), 'yyyy-MM-dd HH:mm:ss');
+    this.data.lastCompletedTestId  = testId;
+    this.data.lastCompletedIndex   = index;
+    this.data.completed[testId]    = {
+      status:          result.status,
+      similarity:      result.similarity,
+      timestamp:       result.timestamp,
+      screenshotPath:  result.screenshotPath ?? '',
+      actual:          result.actual ?? '',
+      reason:          result.reason ?? '',
+      attempts:        result.attempts ?? 1,
       selectedAttempt: result.selectedAttempt ?? 1,
-      writtenToDocs:  false,   // ← ยังไม่ได้ write
+      writtenToDocs:   false,
+      writtenToSheets: false,
     };
     this._flush();
     logger.debug(`💾 checkpoint: ${testId} (${result.status})`);
   }
 
-  // ทำเครื่องหมายว่า write Docs แล้ว
+  // ทำเครื่องหมายว่า write ไปแล้ว (รองรับทั้ง docs และ sheets)
   markWrittenToDocs(testId) {
     if (this.data.completed[testId]) {
-      this.data.completed[testId].writtenToDocs = true;
+      this.data.completed[testId].writtenToDocs   = true;
+      this.data.completed[testId].writtenToSheets = true; // sync ให้ตรงกัน
+      this.data.updatedAt = dateFormat(new Date(), 'yyyy-MM-dd HH:mm:ss');
+      this._flush();
+    }
+  }
+
+  markWrittenToSheets(testId) {
+    if (this.data.completed[testId]) {
+      this.data.completed[testId].writtenToSheets = true;
+      this.data.completed[testId].writtenToDocs   = true; // sync ให้ตรงกัน
       this.data.updatedAt = dateFormat(new Date(), 'yyyy-MM-dd HH:mm:ss');
       this._flush();
     }
@@ -114,9 +123,10 @@ class ProgressTracker {
     return Boolean(this.data?.completed?.[testId]);
   }
 
-  // นับ pending (ยังไม่ได้ write Docs)
+  // นับ pending (ยังไม่ได้ write)
   get pendingDocsCount() {
-    return Object.values(this.data?.completed ?? {}).filter(v => !v.writtenToDocs).length;
+    return Object.values(this.data?.completed ?? {})
+      .filter(v => !v.writtenToDocs && !v.writtenToSheets).length;
   }
 
   // ลบ checkpoint
