@@ -35,7 +35,9 @@
     "drive:upload": "node src/index.js --upload-screenshots",
     "check": "node src/index.js --health-check",
     "lock:status": "node src/modules/rangeCoordinator.js --status",
-    "lock:clear": "node src/modules/rangeCoordinator.js --clear"
+    "lock:clear": "node src/modules/rangeCoordinator.js --clear",
+    "write:sheets": "node write_to_sheets.js",
+    "write:sheets:dry": "node write_to_sheets.js --dry-run"
   },
   "dependencies": {
     "playwright": "^1.44.0",
