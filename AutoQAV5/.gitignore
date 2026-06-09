@@ -1,6 +1,7 @@
 credentials/
 logs/
 node_modules/
+output/
 reports/
 screenshots/
 .env
