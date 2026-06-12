@@ -1,0 +1,16 @@
+credentials/
+datasets/
+logs/
+node_modules/
+output/
+Profiles/
+reports/
+screenshots/
+tests/
+.env
+.env.run
+run_config-low.js
+UPGRADE_GUIDE.md
+
+.DS_Store
+Thumbs.db
