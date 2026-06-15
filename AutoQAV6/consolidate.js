@@ -142,6 +142,44 @@ function readCheckpoints() {
 // ─────────────────────────────────────────────────────────────
 // 2. READ GOOGLE SHEETS
 // ─────────────────────────────────────────────────────────────
+// Convert a 0-based column index back to its letter (for logging).
+function colLetter(i) {
+  return i < 0 ? '-' : String.fromCharCode(65 + i);
+}
+
+// Pick the best matching column by header keyword, preferring the
+// candidate that actually has data (handles tabs where the "real" column
+// is unlabeled / the labeled one is empty — e.g. Expected vs คำตอบ).
+function pickHeaderCol(header, dataRows, predicates) {
+  const cands = [];
+  header.forEach((h, i) => { if (predicates.some(p => h.includes(p))) cands.push(i); });
+  if (!cands.length) return -1;
+  let best = cands[0], bestN = -1;
+  for (const ci of cands) {
+    const n = dataRows.reduce((a, r) => a + ((r[ci] ?? '').toString().trim() ? 1 : 0), 0);
+    if (n > bestN) { bestN = n; best = ci; }
+  }
+  return best;
+}
+
+// Find the column holding the most PASS/FAIL/PARTIAL values. Data-driven,
+// so it works even when the status header is missing or mislabeled.
+function detectValueCol(dataRows, re) {
+  const counts = {};
+  dataRows.forEach(r => r.forEach((cell, ci) => {
+    if (re.test((cell ?? '').toString().trim())) counts[ci] = (counts[ci] ?? 0) + 1;
+  }));
+  let best = -1, bestN = 0;
+  for (const [ci, n] of Object.entries(counts)) { if (n > bestN) { bestN = n; best = +ci; } }
+  return best;
+}
+
+const STATUS_RE = /^(PASS|FAIL|PARTIAL)$/i;
+const TESTID_RE = /^(TRD_AI_|TC_)\w*$/i;
+
+// Read EVERY tab of the spreadsheet, detecting columns per tab.
+// Tabs vary wildly in layout, so we detect by header keyword + data, and
+// detect the status column by scanning for PASS/FAIL/PARTIAL values.
 async function readSheets(auth) {
   const results = {};
 
@@ -152,52 +190,92 @@ async function readSheets(auth) {
 
   try {
     const sheets = google.sheets({ version: 'v4', auth });
-    const maxCol  = Math.max(SHEET_COL_Q, SHEET_COL_E, SHEET_COL_D, SHEET_COL_S, SHEET_COL_T) + 1;
-    const endLetter = String.fromCharCode(65 + maxCol);
-    const range   = `${SHEET_NAME}!A${SHEET_START}:${endLetter}`;
 
-    const res  = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range,
-      valueRenderOption: 'FORMATTED_VALUE',
-    });
+    // Honor an explicit tab name if given; otherwise scan all tabs.
+    let tabs;
+    if (process.env.GOOGLE_SHEET_NAME) {
+      tabs = [process.env.GOOGLE_SHEET_NAME];
+    } else {
+      const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+      tabs = meta.data.sheets.map(s => s.properties.title);
+    }
 
-    const rows = res.data.values ?? [];
-    let count = 0;
+    let grandTotal = 0, grandWithStatus = 0;
 
-    rows.forEach((row, idx) => {
-      const question = row[SHEET_COL_Q]?.trim() ?? '';
-      const expected = row[SHEET_COL_E]?.trim() ?? '';
-      const actual   = row[SHEET_COL_D]?.trim() ?? '';
-      const status   = row[SHEET_COL_S]?.trim() ?? '';
-      const ts       = row[SHEET_COL_T]?.trim() ?? '';
-      const rowIndex = SHEET_START + idx;
+    for (const tab of tabs) {
+      let res;
+      try {
+        res = await sheets.spreadsheets.values.get({
+          spreadsheetId: SPREADSHEET_ID,
+          range: `'${tab}'!A1:Z`,
+          valueRenderOption: 'FORMATTED_VALUE',
+        });
+      } catch (e) {
+        console.log(`  [Sheets] "${tab}" → read error: ${e.message}`);
+        continue;
+      }
 
-      if (!question) return;
+      const rows = res.data.values ?? [];
+      if (rows.length < 2) { console.log(`  [Sheets] "${tab}" → skipped (no data)`); continue; }
 
-      // testId = TC_{rowIndex} (ตรงกับ sheetsClient.js ที่ใช้ auto-generate)
-      const testId = `TC_${rowIndex}`;
+      const header   = (rows[0] ?? []).map(h => normalizeHeader(h));
+      const dataRows = rows.slice(1);
 
-      results[testId] = {
-        testId,
-        source:    'sheets',
-        status:    status   || '',
-        actual:    actual   || '',
-        expected:  expected || '',
-        question:  question || '',
-        similarity: 0,
-        reason:    '',
-        timestamp: ts || '',
-        screenshotPath: '',
-        attempts:  1,
-        rowIndex,
-      };
-      count++;
-    });
+      const colQ      = pickHeaderCol(header, dataRows, ['question', 'คำถาม']);
+      if (colQ < 0) { console.log(`  [Sheets] "${tab}" → skipped (no question column — likely a summary tab)`); continue; }
 
-    console.log(`  [Sheets] ${SHEET_NAME} → ${count} rows อ่านได้`);
-    const withResults = Object.values(results).filter(r => r.status).length;
-    console.log(`  [Sheets] มีผล (status ไม่ว่าง): ${withResults}`);
+      const colExp    = pickHeaderCol(header, dataRows, ['expected', 'answer', 'คำตอบ']);
+      const colActual = pickHeaderCol(header, dataRows, ['actualresult', 'actual', 'result']);
+      const colTs     = pickHeaderCol(header, dataRows, ['timestamp', 'time']);
+      const colShot   = pickHeaderCol(header, dataRows, ['screenshot']);
+      const colRemark = pickHeaderCol(header, dataRows, ['remark']);
+      let   colId     = pickHeaderCol(header, dataRows, ['testcaseid', 'testid', 'testcase']);
+      if (colId < 0) colId = detectValueCol(dataRows, TESTID_RE);
+
+      // Status: trust the data (PASS/FAIL/PARTIAL values) over the header.
+      let colStatus = detectValueCol(dataRows, STATUS_RE);
+      if (colStatus < 0) colStatus = pickHeaderCol(header, dataRows, ['status']);
+
+      const tabSlug = tab.trim().replace(/\s+/g, '_');
+      let count = 0, withStatus = 0;
+
+      dataRows.forEach((row, idx) => {
+        const get = (ci) => ci >= 0 ? ((row[ci] ?? '').toString().trim()) : '';
+        const question = get(colQ);
+        if (!question) return;
+
+        const rawId    = get(colId);
+        const status   = get(colStatus).toUpperCase();
+        const rowIndex = idx + 2; // 1-based, +1 for the header row
+        // Prefix with the tab so IDs (TRD_AI_01 restarts every tab) never collide.
+        const testId   = `${tabSlug}__${rawId || `R${rowIndex}`}`;
+
+        results[testId] = {
+          testId,
+          source:    'sheets',
+          status:    STATUS_RE.test(status) ? status : '',
+          actual:    get(colActual) || get(colRemark),
+          expected:  get(colExp),
+          question,
+          similarity: 0,
+          reason:    get(colRemark),
+          timestamp: get(colTs),
+          screenshotPath: get(colShot),
+          attempts:  1,
+          rowIndex,
+          tab,
+        };
+        count++;
+        if (results[testId].status) withStatus++;
+      });
+
+      grandTotal += count;
+      grandWithStatus += withStatus;
+      console.log(`  [Sheets] "${tab}" → ${count} rows (${withStatus} w/ status)`
+        + `  [Q=${colLetter(colQ)} Exp=${colLetter(colExp)} Act=${colLetter(colActual)} Stat=${colLetter(colStatus)}]`);
+    }
+
+    console.log(`  [Sheets] TOTAL → ${grandTotal} rows, ${grandWithStatus} with status`);
   } catch (err) {
     console.error(`  [Sheets] ERROR: ${err.message}`);
   }
@@ -386,7 +464,10 @@ function merge(jsonData, sheetsData, docsData) {
   }
 
   function addOrMerge(entry) {
-    let qNorm = entry.question ? norm(entry.question) : null;
+    // Scope the question-dedup key by tab: the same question text appears in
+    // multiple tabs (e.g. "Law" and its reviewed copy "Law (review)") and must
+    // NOT be merged into one entry.
+    let qNorm = entry.question ? `${entry.tab ?? ''}|${norm(entry.question)}` : null;
     let existingId = qNorm ? questionToId[qNorm] : null;
 
     // Try finding by exact testId or alternative translated ID

@@ -50,6 +50,25 @@ function extractNumbers(text) {
   return text.match(/\d+/g) ?? [];
 }
 
+// Character bigrams of the text with whitespace removed — Thai is not
+// space-delimited, so character n-grams compare far better than word tokens.
+function bigrams(text) {
+  const t = (text ?? '').replace(/\s+/g, '');
+  const grams = [];
+  for (let i = 0; i < t.length - 1; i++) grams.push(t.slice(i, i + 2));
+  return grams;
+}
+
+// Fraction of the EXPECTED answer's bigrams that appear in the actual answer.
+// This is recall of the ground truth — it does NOT shrink when the bot adds
+// extra words, so a correct-but-verbose answer still scores high.
+function bigramRecall(expected, actual) {
+  const exp = bigrams(expected);
+  if (!exp.length) return 0;
+  const act = new Set(bigrams(actual));
+  return exp.filter(g => act.has(g)).length / exp.length;
+}
+
 function hasForeignNoise(text) {
   return /[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\ufffd]/.test(text ?? '');
 }
@@ -84,22 +103,27 @@ function scoreAnswer(expected, actual, question = '') {
     ? stringSimilarity.compareTwoStrings(normQuestion, normActual)
     : 0;
 
-  const expectedWords = new Set(normExpected.split(/\s+/).filter(Boolean));
-  const actualWords = new Set(normActual.split(/\s+/).filter(Boolean));
-  const intersection = [...expectedWords].filter(w => actualWords.has(w)).length;
-  const union = new Set([...expectedWords, ...actualWords]).size;
-  const jaccardScore = union > 0 ? intersection / union : 0;
+  // Token coverage: fraction of the expected's whitespace tokens that appear
+  // (as substrings) in the actual — catches exact facts, codes and numbers.
+  const expectedTokens = normExpected.split(/\s+/).filter(t => t.length >= 2);
+  const tokensCovered = expectedTokens.filter(t => normActual.includes(t)).length;
+  const tokenCoverage = expectedTokens.length ? tokensCovered / expectedTokens.length : 0;
+
+  // Recall of the expected answer's content — the primary, length-robust signal.
+  const recall = bigramRecall(normExpected, normActual);
 
   const containmentBonus = normExpected && normActual.includes(normExpected) ? 0.15 : 0;
   const expectedNums = extractNumbers(normExpected);
   const numbersPresent = expectedNums.every(n => normActual.includes(n));
   const numberBonus = expectedNums.length > 0 && numbersPresent ? 0.1 : 0;
 
+  // Coverage-weighted: reward answers that CONTAIN the expected content,
+  // rather than answers that are the same LENGTH as it.
   const blended = Math.min(
     1,
-    expectedDice * 0.35 +
-    questionDice * 0.25 +
-    jaccardScore * 0.20 +
+    recall * 0.60 +
+    tokenCoverage * 0.20 +
+    expectedDice * 0.10 +
     containmentBonus +
     numberBonus
   );
@@ -107,7 +131,8 @@ function scoreAnswer(expected, actual, question = '') {
   return {
     expectedDice,
     questionDice,
-    jaccardScore,
+    recall,
+    tokenCoverage,
     blended,
     expectedNums,
     numbersPresent,
@@ -133,6 +158,12 @@ export function classify(expected, actual, question = '') {
   if (failKeyword) {
     logger.debug(`FAIL keyword: "${failKeyword}"`);
     return { status: STATUS.FAIL, similarity: 0, reason: `Cannot answer: "${failKeyword}"` };
+  }
+
+  // No ground truth to compare against — the bot answered, but we can't score
+  // correctness. Flag for manual review rather than calling it a content FAIL.
+  if (!normalise(expected)) {
+    return { status: STATUS.PARTIAL, similarity: 0, reason: 'No expected answer in sheet — needs manual review' };
   }
 
   const score = scoreAnswer(expected, actual, question);
