@@ -61,8 +61,48 @@ const COOLDOWN_MS = parseInt(flag('cooldown', '60000'), 10);
 // Which gateway "source" to test: external | internal | both
 const SOURCE_ARG = (flag('source', 'external') || 'external').toLowerCase();
 const SOURCES = SOURCE_ARG === 'both' ? ['external', 'internal'] : [SOURCE_ARG];
+// Retry mode: re-run only questions that never got an answer in prior result files.
+const RETRY_FAILED = argv.includes('--retry-failed');
+// In retry mode, optionally restrict to one recorded source (e.g. --source=internal).
+const SOURCE_FLAG_PRESENT = argv.some(x => x.startsWith('--source='));
+const RETRY_SOURCE_FILTER = (SOURCE_FLAG_PRESENT && SOURCE_ARG !== 'both') ? SOURCE_ARG : null;
+// Self-terminate when the server stops recovering: give up after this many
+// cooldowns happen with no successful answer in between.
+const MAX_DEAD_COOLDOWNS = parseInt(flag('max-dead-cooldowns', '2'), 10);
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Build the retry job list from prior both-source run files: every question
+// that never got a real answer (request error / empty), minus any that DID get
+// answered in some file. Returns [{ c, source }] ready for the main loop.
+function loadFailedJobs() {
+  const files = fs.readdirSync(OUTPUT_DIR)
+    .filter(f => f.startsWith('webhook_test_') && f.endsWith('.json'))
+    .map(f => path.join(OUTPUT_DIR, f));
+
+  const answered = new Set();   // key = testId|source that got a real answer anywhere
+  const failed = new Map();     // key -> job (deduped)
+  let scanned = 0;
+  for (const fp of files) {
+    let data;
+    try { data = JSON.parse(fs.readFileSync(fp, 'utf8')); } catch { continue; }
+    if (!Array.isArray(data.sources)) continue;   // only the full both-source runs ("both days")
+    scanned++;
+    for (const r of data.results ?? []) {
+      const source = r.source || 'external';
+      const key = `${r.testId}|${source}`;
+      if (r.actual && !r.error) { answered.add(key); continue; }
+      if (!failed.has(key)) {
+        failed.set(key, { c: { tab: r.tab, testId: r.testId, rowIndex: r.rowIndex, question: r.question, expected: r.expected }, source });
+      }
+    }
+  }
+  let jobs = [...failed.entries()].filter(([k]) => !answered.has(k)).map(([, j]) => j);
+  if (RETRY_SOURCE_FILTER) jobs = jobs.filter(j => j.source === RETRY_SOURCE_FILTER);
+  console.log(`  Scanned ${scanned} prior run file(s): ${answered.size} already answered, ${jobs.length} still-failed to retry`
+    + (RETRY_SOURCE_FILTER ? ` (source="${RETRY_SOURCE_FILTER}" only)` : ''));
+  return jobs;
+}
 
 // ── Column detection (same approach as consolidate.js) ─────────
 function normalizeHeader(h) { return (h ?? '').toString().replace(/\s+/g, '').toLowerCase(); }
@@ -197,36 +237,43 @@ async function main() {
   console.log('═'.repeat(60));
   console.log(`  Endpoint : ${WEBHOOK_URL}`);
   console.log(`  Scope    : ${RUN_ALL ? 'ALL questions' : `${PER_TAB_LIMIT} per tab`}${ONLY_TAB ? ` (tab="${ONLY_TAB}")` : ''}`);
-  console.log(`  Sources  : ${SOURCES.join(', ')}`);
+  console.log(`  Mode     : ${RETRY_FAILED ? 'RETRY failed questions from prior runs' : 'normal'}`);
+  console.log(`  Sources  : ${RETRY_FAILED ? 'as-recorded' : SOURCES.join(', ')}`);
   console.log(`  Delay    : ${DELAY_MS}ms between calls`);
-  console.log(`  Retries  : ${RETRIES} (backoff ${RETRY_BACKOFF_MS}ms ↑) · cooldown ${COOLDOWN_MS / 1000}s after ${COOLDOWN_AFTER} fails\n`);
+  console.log(`  Retries  : ${RETRIES} (backoff ${RETRY_BACKOFF_MS}ms ↑) · cooldown ${COOLDOWN_MS / 1000}s after ${COOLDOWN_AFTER} fails · give up after ${MAX_DEAD_COOLDOWNS} dead cooldowns\n`);
 
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-  const auth = new google.auth.GoogleAuth({
-    keyFile: KEY_FILE, scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
-  });
-  const client = await auth.getClient();
+  // Build the job list.
+  let jobs;
+  if (RETRY_FAILED) {
+    console.log('── Loading failed questions from prior runs');
+    jobs = loadFailedJobs();
+  } else {
+    const auth = new google.auth.GoogleAuth({
+      keyFile: KEY_FILE, scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+    });
+    const client = await auth.getClient();
+    console.log('── Reading questions from sheet');
+    const cases = await readQuestions(client);
+    jobs = [];
+    for (const c of cases) for (const source of SOURCES) jobs.push({ c, source });
+    console.log(`\n  ${cases.length} question(s) × ${SOURCES.length} source(s) [${SOURCES.join(', ')}] = ${jobs.length} call(s)`);
+  }
+  console.log(`\n  Total calls this run: ${jobs.length}\n`);
 
-  console.log('── Reading questions from sheet');
-  const cases = await readQuestions(client);
-
-  // Build the job list: every question × every requested source.
-  const jobs = [];
-  for (const c of cases) for (const source of SOURCES) jobs.push({ c, source });
-  console.log(`\n  ${cases.length} question(s) × ${SOURCES.length} source(s) [${SOURCES.join(', ')}] = ${jobs.length} call(s)\n`);
-
+  const usedSources = [...new Set(jobs.map(j => j.source))];
   const results = [];
   const tally = {};                       // tally[source] = {PASS,PARTIAL,FAIL}
-  for (const s of SOURCES) tally[s] = { PASS: 0, PARTIAL: 0, FAIL: 0 };
+  for (const s of usedSources) tally[s] = { PASS: 0, PARTIAL: 0, FAIL: 0 };
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const outFile = path.join(OUTPUT_DIR, `webhook_test_${stamp}.json`);
   const flush = (done) => fs.writeFileSync(outFile, JSON.stringify({
     generatedAt: new Date().toISOString(),
     endpoint: WEBHOOK_URL,
-    scope: RUN_ALL ? 'all' : `${PER_TAB_LIMIT}/tab`,
-    sources: SOURCES,
+    scope: RETRY_FAILED ? 'retry-failed' : (RUN_ALL ? 'all' : `${PER_TAB_LIMIT}/tab`),
+    sources: usedSources,
     complete: !!done,
     progress: `${results.length}/${jobs.length}`,
     total: results.length,
@@ -234,10 +281,15 @@ async function main() {
     results,
   }, null, 2));
 
+  // The gateway 500s on sessionIds longer than ~48 chars, so keep them SHORT.
+  // q + run tag (unique per run) + job index → unique but ~10 chars max.
+  const runTag = Date.now().toString(36).slice(-4);
   let consecutiveFails = 0;
+  let deadCooldowns = 0;       // cooldowns with no success since the last one
+  let stoppedEarly = false;
   for (let i = 0; i < jobs.length; i++) {
     const { c, source } = jobs[i];
-    const sessionId = `qa-${source}-${c.testId}-${Date.now()}`;
+    const sessionId = `q${runTag}${i}`;
     const resp = await askBotWithRetry(c.question, sessionId, source);
 
     let verdict;
@@ -265,6 +317,12 @@ async function main() {
     if (resp.error || !resp.answer) {
       consecutiveFails++;
       if (consecutiveFails >= COOLDOWN_AFTER) {
+        deadCooldowns++;
+        if (deadCooldowns >= MAX_DEAD_COOLDOWNS) {
+          console.log(`  🛑 Server not recovering after ${deadCooldowns} cooldowns — stopping early. Re-run later to continue.`);
+          stoppedEarly = true;
+          break;
+        }
         console.log(`  ⏸  ${consecutiveFails} failures in a row — cooling down ${COOLDOWN_MS / 1000}s to let the server recover…`);
         flush(false);
         await sleep(COOLDOWN_MS);
@@ -272,17 +330,20 @@ async function main() {
       }
     } else {
       consecutiveFails = 0;
+      deadCooldowns = 0;       // a success means the server came back — reset
     }
 
     if (results.length % 25 === 0) flush(false);   // periodic checkpoint
     if (i < jobs.length - 1) await sleep(DELAY_MS);
   }
 
-  flush(true);   // final write
+  flush(!stoppedEarly);   // final write (complete=false if we bailed early)
 
+  const answeredNow = results.filter(r => r.actual && !r.error).length;
   console.log('\n' + '═'.repeat(60));
-  console.log(` RESULTS: ${results.length} call(s) across ${cases.length} question(s)`);
-  for (const s of SOURCES) {
+  console.log(` RESULTS: ${results.length} call(s) made${stoppedEarly ? ' (stopped early — server down)' : ''}`);
+  console.log(`   recovered (got an answer this run): ${answeredNow}`);
+  for (const s of usedSources) {
     const t = tally[s];
     console.log(`   source="${s}"  →  ✅ ${t.PASS}   ⚠️ ${t.PARTIAL}   ❌ ${t.FAIL}`);
   }
