@@ -18,7 +18,7 @@
  *   node run_webhook_test.js                 # 5 questions per tab (smoke test)
  *   node run_webhook_test.js --limit=5       # N questions per tab
  *   node run_webhook_test.js --tab="General" # only one tab
- *   node run_webhook_test.js --all           # every question in every tab
+ *   node run_webhook_test.js --all           # every question in every tab, capped per tab
  *   node run_webhook_test.js --delay=1500    # ms between requests
  */
 
@@ -27,6 +27,7 @@ import fs from 'fs';
 import path from 'path';
 import { google } from 'googleapis';
 import { fileURLToPath } from 'url';
+import ExcelJS from 'exceljs';
 
 // config/index.js throws unless a document id exists; we only need Sheets +
 // the classifier here, so satisfy it with a harmless placeholder.
@@ -49,7 +50,8 @@ const flag = (name, dflt) => {
   return a ? a.split('=').slice(1).join('=') : dflt;
 };
 const RUN_ALL = argv.includes('--all');
-const PER_TAB_LIMIT = RUN_ALL ? Infinity : parseInt(flag('limit', '5'), 10);
+const MAX_QUESTIONS_PER_TOPIC = parseInt(process.env.MAX_QUESTIONS_PER_TOPIC || '100', 10);
+const PER_TAB_LIMIT = RUN_ALL ? MAX_QUESTIONS_PER_TOPIC : parseInt(flag('limit', '5'), 10);
 const ONLY_TAB = flag('tab', null);
 const DELAY_MS = parseInt(flag('delay', '1500'), 10);
 const REQUEST_TIMEOUT_MS = parseInt(flag('timeout', '90000'), 10);
@@ -69,8 +71,254 @@ const RETRY_SOURCE_FILTER = (SOURCE_FLAG_PRESENT && SOURCE_ARG !== 'both') ? SOU
 // Self-terminate when the server stops recovering: give up after this many
 // cooldowns happen with no successful answer in between.
 const MAX_DEAD_COOLDOWNS = parseInt(flag('max-dead-cooldowns', '2'), 10);
+const EXPORT_EXCEL = !argv.includes('--no-excel');
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function sanitizeSheetName(name, usedNames) {
+  const cleanedBase = (name || 'Topic')
+    .toString()
+    .replace(/[\\/*?:\[\]]/g, '_')
+    .trim()
+    .slice(0, 31) || 'Topic';
+
+  let candidate = cleanedBase;
+  let suffix = 1;
+  while (usedNames.has(candidate)) {
+    const tail = `_${suffix++}`;
+    candidate = `${cleanedBase.slice(0, 31 - tail.length)}${tail}`;
+  }
+  usedNames.add(candidate);
+  return candidate;
+}
+
+function pct(n, d) {
+  return d === 0 ? 0 : n / d;
+}
+
+function safeNumber(value) {
+  return Number.isFinite(value) ? value : null;
+}
+
+async function writeExcelReport(results, meta) {
+  const outPath = path.join(OUTPUT_DIR, `webhook_test_${meta.stamp}_summary.xlsx`);
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = 'AutoQAV6';
+  workbook.created = new Date();
+  workbook.modified = new Date();
+
+  const headerFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '1F4E78' } };
+  const headerFont = { color: { argb: 'FFFFFFFF' }, bold: true };
+  const passFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'C6EFCE' } };
+  const partialFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEB9C' } };
+  const failFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'F4CCCC' } };
+  const border = {
+    top: { style: 'thin', color: { argb: 'D0D7DE' } },
+    left: { style: 'thin', color: { argb: 'D0D7DE' } },
+    bottom: { style: 'thin', color: { argb: 'D0D7DE' } },
+    right: { style: 'thin', color: { argb: 'D0D7DE' } },
+  };
+
+  const byTopic = new Map();
+  for (const row of results) {
+    const topic = row.tab || 'Unknown';
+    if (!byTopic.has(topic)) byTopic.set(topic, []);
+    byTopic.get(topic).push(row);
+  }
+
+  const indexSheet = workbook.addWorksheet('Topics');
+  indexSheet.columns = [
+    { header: 'Topic', key: 'topic', width: 24 },
+    { header: 'Sheet', key: 'sheet', width: 18 },
+    { header: 'Total', key: 'total', width: 10 },
+    { header: 'PASS', key: 'pass', width: 10 },
+    { header: 'PARTIAL', key: 'partial', width: 10 },
+    { header: 'FAIL', key: 'fail', width: 10 },
+    { header: 'Accuracy', key: 'accuracy', width: 12 },
+  ];
+  indexSheet.getRow(1).eachCell(cell => {
+    cell.fill = headerFill;
+    cell.font = headerFont;
+    cell.border = border;
+    cell.alignment = { vertical: 'middle', horizontal: 'center' };
+  });
+  indexSheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+  const summarySheet = workbook.addWorksheet('Summary');
+  summarySheet.addRow(['Webhook Test Summary']);
+  summarySheet.getRow(1).font = { bold: true, size: 16 };
+  summarySheet.addRow([`Source file: webhook_test_${meta.stamp}.json`]);
+  summarySheet.addRow([`Generated at: ${meta.generatedAt}`]);
+  summarySheet.addRow([`Endpoint: ${meta.endpoint}`]);
+  summarySheet.addRow([`Scope: ${meta.scope}`]);
+  summarySheet.addRow([]);
+  summarySheet.addRow(['Metric', 'Value']);
+  summarySheet.getRow(7).eachCell(cell => {
+    cell.fill = headerFill;
+    cell.font = headerFont;
+    cell.border = border;
+  });
+
+  const overall = Object.values(meta.summary || {}).reduce((acc, sourceCounts) => {
+    acc.PASS += Number(sourceCounts?.PASS) || 0;
+    acc.PARTIAL += Number(sourceCounts?.PARTIAL) || 0;
+    acc.FAIL += Number(sourceCounts?.FAIL) || 0;
+    return acc;
+  }, { PASS: 0, PARTIAL: 0, FAIL: 0 });
+  const total = overall.PASS + overall.PARTIAL + overall.FAIL;
+  const metrics = [
+    ['Total',                   total,                                      false],
+    ['PASS',                    overall.PASS,                               false],
+    ['PARTIAL',                 overall.PARTIAL,                            false],
+    ['FAIL',                    overall.FAIL,                               false],
+    ['Accuracy (PASS only)',    pct(overall.PASS, total),                   true],
+    ['Accuracy (PASS+PARTIAL)', pct(overall.PASS + overall.PARTIAL, total), true],
+    ['Review Rate',             pct(overall.PARTIAL, total),                true],
+    ['Fail Rate',               pct(overall.FAIL, total),                   true],
+  ];
+  for (const [label, value, isPercent] of metrics) {
+    const r = summarySheet.addRow([label, value]);
+    if (isPercent) r.getCell(2).numFmt = '0.00%';
+  }
+  summarySheet.views = [{ state: 'frozen', ySplit: 7 }];
+  summarySheet.getColumn(1).width = 22;
+  summarySheet.getColumn(2).width = 18;
+
+  const resultsSheet = workbook.addWorksheet('Results');
+  resultsSheet.columns = [
+    { header: 'Topic', key: 'tab', width: 20 },
+    { header: 'Test ID', key: 'testId', width: 28 },
+    { header: 'Row', key: 'rowIndex', width: 8 },
+    { header: 'Question', key: 'question', width: 50 },
+    { header: 'Expected', key: 'expected', width: 50 },
+    { header: 'Actual', key: 'actual', width: 60 },
+    { header: 'Status', key: 'status', width: 12 },
+    { header: 'Similarity', key: 'similarity', width: 12 },
+    { header: 'Reason', key: 'reason', width: 38 },
+    { header: 'Latency (ms)', key: 'latencyMs', width: 14 },
+    { header: 'Attempts', key: 'attempts', width: 10 },
+    { header: 'Error', key: 'error', width: 20 },
+  ];
+  resultsSheet.getRow(1).eachCell(cell => {
+    cell.fill = headerFill;
+    cell.font = headerFont;
+    cell.border = border;
+    cell.alignment = { vertical: 'middle', horizontal: 'center' };
+  });
+  resultsSheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+  for (const row of results) {
+    const record = resultsSheet.addRow({
+      ...row,
+      rowIndex: safeNumber(row.rowIndex),
+      similarity: safeNumber(row.similarity),
+      latencyMs: safeNumber(row.latencyMs),
+      attempts: safeNumber(row.attempts),
+    });
+    record.getCell('similarity').numFmt = '0.00%';  // Bug #4 fix: was '0.0000'
+    const fill = row.status === 'PASS' ? passFill : row.status === 'PARTIAL' ? partialFill : failFill;
+    record.eachCell(cell => {
+      cell.border = border;
+      cell.alignment = { vertical: 'top', wrapText: true };
+      cell.fill = fill;
+    });
+  }
+
+  const usedNames = new Set(['Topics', 'Summary', 'Results']);
+  // Bug #6 fix: use 'th' locale so Thai tab names sort correctly
+  for (const [topic, rows] of [...byTopic.entries()].sort((a, b) => a[0].localeCompare(b[0], ['th', 'en']))) {
+    const wsName = sanitizeSheetName(topic, usedNames);
+    const sheet = workbook.addWorksheet(wsName);
+    const counts = rows.reduce((acc, r) => {
+      acc[r.status] = (acc[r.status] ?? 0) + 1;
+      return acc;
+    }, { PASS: 0, PARTIAL: 0, FAIL: 0 });
+
+    // Bug #3 fix: separate label row and data row so numFmt works on numeric cells
+    sheet.addRow([`Topic: ${topic}`]);
+    sheet.getRow(1).font = { bold: true, size: 14 };
+    sheet.addRow(['Total', 'PASS', 'PARTIAL', 'FAIL', 'Accuracy (PASS only)', 'Accuracy (PASS+PARTIAL)']);
+    sheet.getRow(2).eachCell(cell => { cell.font = { bold: true }; cell.border = border; });
+    const statsRow = sheet.addRow([
+      rows.length,
+      counts.PASS,
+      counts.PARTIAL,
+      counts.FAIL,
+      pct(counts.PASS, rows.length),
+      pct(counts.PASS + counts.PARTIAL, rows.length),
+    ]);
+    statsRow.getCell(5).numFmt = '0.00%';
+    statsRow.getCell(6).numFmt = '0.00%';
+    statsRow.eachCell(cell => { cell.border = border; });
+
+    sheet.addRow([]);
+    sheet.addRow(['Test ID', 'Row', 'Question', 'Expected', 'Actual', 'Status', 'Similarity', 'Reason', 'Latency (ms)', 'Attempts', 'Error']);
+    sheet.getRow(5).eachCell(cell => {
+      cell.fill = headerFill;
+      cell.font = headerFont;
+      cell.border = border;
+    });
+    sheet.views = [{ state: 'frozen', ySplit: 5 }];
+    sheet.columns = [
+      { key: 'testId', width: 28 },
+      { key: 'rowIndex', width: 8 },
+      { key: 'question', width: 50 },
+      { key: 'expected', width: 50 },
+      { key: 'actual', width: 60 },
+      { key: 'status', width: 12 },
+      { key: 'similarity', width: 12 },
+      { key: 'reason', width: 38 },
+      { key: 'latencyMs', width: 14 },
+      { key: 'attempts', width: 10 },
+      { key: 'error', width: 20 },
+    ];
+
+    for (const row of rows) {
+      const record = sheet.addRow({
+        testId: row.testId,
+        rowIndex: safeNumber(row.rowIndex),
+        question: row.question,
+        expected: row.expected,
+        actual: row.actual,
+        status: row.status,
+        similarity: safeNumber(row.similarity),
+        reason: row.reason,
+        latencyMs: safeNumber(row.latencyMs),
+        attempts: safeNumber(row.attempts),
+        error: row.error,
+      });
+      record.getCell('similarity').numFmt = '0.00%';  // Bug #4 fix: was '0.0000'
+      const fill = row.status === 'PASS' ? passFill : row.status === 'PARTIAL' ? partialFill : failFill;
+      record.eachCell(cell => {
+        cell.border = border;
+        cell.alignment = { vertical: 'top', wrapText: true };
+        cell.fill = fill;
+      });
+    }
+
+    indexSheet.addRow({
+      topic,
+      sheet: wsName,
+      total: rows.length,
+      pass: counts.PASS,
+      partial: counts.PARTIAL,
+      fail: counts.FAIL,
+      accuracy: pct(counts.PASS, rows.length),
+    });
+  }
+
+  indexSheet.getColumn('accuracy').numFmt = '0.00%';
+  for (let i = 2; i <= indexSheet.rowCount; i++) {
+    const row = indexSheet.getRow(i);
+    row.eachCell(cell => {
+      cell.border = border;
+      cell.alignment = { vertical: 'top', wrapText: true };
+    });
+  }
+
+  await workbook.xlsx.writeFile(outPath);
+  console.log(`  📊 Excel summary saved: ${outPath}`);
+}
 
 // Build the retry job list from prior both-source run files: every question
 // that never got a real answer (request error / empty), minus any that DID get
@@ -172,7 +420,7 @@ async function readQuestions(auth) {
       });
       taken++;
     }
-    console.log(`  "${tab}" → took ${taken} question(s)`);
+    console.log(`  "${tab}" → took ${taken} question(s)${RUN_ALL && MAX_QUESTIONS_PER_TOPIC > 0 ? ` (cap ${MAX_QUESTIONS_PER_TOPIC})` : ''}`);
   }
   return cases;
 }
@@ -236,11 +484,15 @@ async function main() {
   console.log(' Webhook QA Test — PromptX (น้องรักษ์) UAT gateway');
   console.log('═'.repeat(60));
   console.log(`  Endpoint : ${WEBHOOK_URL}`);
-  console.log(`  Scope    : ${RUN_ALL ? 'ALL questions' : `${PER_TAB_LIMIT} per tab`}${ONLY_TAB ? ` (tab="${ONLY_TAB}")` : ''}`);
+  console.log(`  Scope    : ${RUN_ALL ? `ALL questions up to ${PER_TAB_LIMIT} per tab` : `${PER_TAB_LIMIT} per tab`}${ONLY_TAB ? ` (tab="${ONLY_TAB}")` : ''}`);
   console.log(`  Mode     : ${RETRY_FAILED ? 'RETRY failed questions from prior runs' : 'normal'}`);
   console.log(`  Sources  : ${RETRY_FAILED ? 'as-recorded' : SOURCES.join(', ')}`);
   console.log(`  Delay    : ${DELAY_MS}ms between calls`);
   console.log(`  Retries  : ${RETRIES} (backoff ${RETRY_BACKOFF_MS}ms ↑) · cooldown ${COOLDOWN_MS / 1000}s after ${COOLDOWN_AFTER} fails · give up after ${MAX_DEAD_COOLDOWNS} dead cooldowns\n`);
+
+  if (RUN_ALL && MAX_QUESTIONS_PER_TOPIC > 0) {
+    console.log(`  Topic cap: ${MAX_QUESTIONS_PER_TOPIC} question(s) per tab/topic`);
+  }
 
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
@@ -269,14 +521,16 @@ async function main() {
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const outFile = path.join(OUTPUT_DIR, `webhook_test_${stamp}.json`);
+  const scope = RETRY_FAILED ? 'retry-failed' : (RUN_ALL ? `all (${PER_TAB_LIMIT}/tab)` : `${PER_TAB_LIMIT}/tab`);
   const flush = (done) => fs.writeFileSync(outFile, JSON.stringify({
     generatedAt: new Date().toISOString(),
     endpoint: WEBHOOK_URL,
-    scope: RETRY_FAILED ? 'retry-failed' : (RUN_ALL ? 'all' : `${PER_TAB_LIMIT}/tab`),
+    scope,
     sources: usedSources,
     complete: !!done,
     progress: `${results.length}/${jobs.length}`,
-    total: results.length,
+    total: jobs.length,       // Bug #1 fix: total planned jobs, not results so far
+    completed: results.length,
     summary: tally,
     results,
   }, null, 2));
@@ -338,6 +592,16 @@ async function main() {
   }
 
   flush(!stoppedEarly);   // final write (complete=false if we bailed early)
+
+  if (EXPORT_EXCEL) {
+    await writeExcelReport(results, {
+      stamp,
+      generatedAt: new Date().toISOString(),
+      endpoint: WEBHOOK_URL,
+      scope,   // Bug #5 fix: reuse the same scope string as JSON output
+      summary: tally,
+    });
+  }
 
   const answeredNow = results.filter(r => r.actual && !r.error).length;
   console.log('\n' + '═'.repeat(60));

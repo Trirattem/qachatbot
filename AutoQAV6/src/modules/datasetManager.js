@@ -100,7 +100,22 @@ export default class DatasetManager {
   filterDataset(dataset, runConfig) {
     if (!runConfig) return dataset.testCases;
 
+    const maxQuestionsPerTopic = config.limits?.maxQuestionsPerTopic ?? 100;
     let selectedCases = [...dataset.testCases];
+
+    if (maxQuestionsPerTopic > 0) {
+      const perTopicCounts = new Map();
+      selectedCases = selectedCases.filter(tc => {
+        const topicKey = this._getTopicKey(tc);
+
+        const used = perTopicCounts.get(topicKey) ?? 0;
+        if (used >= maxQuestionsPerTopic) return false;
+        perTopicCounts.set(topicKey, used + 1);
+        return true;
+      });
+
+      logger.info(`[DatasetManager] จำกัดแต่ละ topic ไม่เกิน ${maxQuestionsPerTopic} ข้อ`);
+    }
 
     // 1. Tag filtering / priority (if implemented in future)
     
@@ -139,6 +154,17 @@ export default class DatasetManager {
     logger.info(`[DatasetManager] จำนวนที่รันได้: ${selectedCases.length} จาก ${dataset.testCases.length}`);
 
     return selectedCases.map(({ originalIndex, ...tc }) => tc);
+  }
+
+  _getTopicKey(tc) {
+    const topic = (tc.topic ?? tc.sheetName ?? '').toString().trim();
+    if (topic) return topic;
+
+    if (Number.isInteger(tc.docLocation?.tableOrdinal)) {
+      return `DOC_TABLE_${tc.docLocation.tableOrdinal + 1}`;
+    }
+
+    return 'DEFAULT_TOPIC';
   }
 
   splitDataset(testCases, totalInstances, instanceId) {

@@ -198,6 +198,11 @@ const config = Object.freeze({
     parity:    optional('RUN_PARITY', 'all'),
   },
 
+  // Dataset limits
+  limits: {
+    maxQuestionsPerTopic: optionalInt('MAX_QUESTIONS_PER_TOPIC', 100),
+  },
+
   // Notification
   notification: {
     lineNotifyToken: optional('LINE_NOTIFY_TOKEN', ''),

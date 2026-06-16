@@ -113,6 +113,7 @@ class DocsClient {
           expected,
           rawTestSteps,
           rawExpected,
+          topic: `Table ${tableInfo.ordinal + 1}`,
           // บอกว่า row นี้มีผลแล้วหรือยัง
           hasExistingResult: Boolean(existingStatus || existingActual || existingRemark),
           existingStatus,

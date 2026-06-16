@@ -115,6 +115,10 @@ node run_webhook_test.js --tab="General" --all      # every question in that tab
 node run_webhook_test.js --all
 ```
 
+By default, `--all` is still capped at `MAX_QUESTIONS_PER_TOPIC=100` per tab/topic.
+Set `MAX_QUESTIONS_PER_TOPIC=0` in `.env` only if you want the runner to read
+every question in that tab without a cap.
+
 ### Choose the source
 ```powershell
 node run_webhook_test.js --all --source=internal    # internal only

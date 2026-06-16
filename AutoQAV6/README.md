@@ -121,7 +121,17 @@ GOOGLE_DOCUMENT_ID=your_document_id
 GOOGLE_SERVICE_ACCOUNT_KEY_PATH=./credentials/google-service-account.json
 ```
 
-### 4. Legacy Browser Mode (ถ้าต้องการใช้ Playwright)
+### 4. Limit questions per topic
+
+To run only the first 100 questions per topic/table/sheet, keep the default:
+
+```dotenv
+MAX_QUESTIONS_PER_TOPIC=100
+```
+
+Set it to `0` if you want to disable the cap.
+
+### 5. Legacy Browser Mode (ถ้าต้องการใช้ Playwright)
 
 ```dotenv
 TRANSPORT_MODE=browser

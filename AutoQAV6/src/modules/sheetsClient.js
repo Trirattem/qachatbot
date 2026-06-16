@@ -132,13 +132,14 @@ class SheetsClient {
         if (!questionVal) return null; // ข้ามแถวว่าง
 
         const rowNumber = startRow + idx;
-        const testId = sheetTestId ? sheetTestId : `TC_${rowNumber}`;
+        const testId = sheetTestId || `TC_${rowNumber}`;
         
         return {
           rowIndex:  rowNumber,
           testId:    testId,
           question:  questionVal,
           expected:  expectedVal,
+          topic:     sname,
         };
       })
       .filter(Boolean);
