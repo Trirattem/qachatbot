@@ -50,7 +50,7 @@ const flag = (name, dflt) => {
   return a ? a.split('=').slice(1).join('=') : dflt;
 };
 const RUN_ALL = argv.includes('--all');
-const MAX_QUESTIONS_PER_TOPIC = parseInt(process.env.MAX_QUESTIONS_PER_TOPIC || '100', 10);
+const MAX_QUESTIONS_PER_TOPIC = parseInt(process.env.MAX_QUESTIONS_PER_TOPIC || '1000', 10);
 const PER_TAB_LIMIT = RUN_ALL ? MAX_QUESTIONS_PER_TOPIC : parseInt(flag('limit', '5'), 10);
 const ONLY_TAB = flag('tab', null);
 const DELAY_MS = parseInt(flag('delay', '1500'), 10);
